@@ -9,6 +9,11 @@ from langchain_community.vectorstores.faiss import FAISS
 from langchain_community.vectorstores.utils import DistanceStrategy
 from langchain_core.documents import Document
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+import pandas as pd
+from typing import List
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+
 
 # 1. 定义 BaseDocumentCompressor 基类
 class BaseDocumentCompressor:#压缩文档
@@ -122,6 +127,98 @@ class SimpleContextualCompressionRetriever:
     def invoke(self, query: str, **kwargs) -> List[Document]:
         """新版本的调用方法"""
         return self.get_relevant_documents(query, **kwargs)
+    
+class MergedRetriever:
+    """手动合并多个检索器，支持权重和去重（普通类，不继承 BaseRetriever）"""
+    
+    def __init__(self, retrievers, weights=None):
+        self.retrievers = retrievers
+        if weights is None:
+            self.weights = [1.0 / len(retrievers)] * len(retrievers)
+        else:
+            self.weights = weights
+    
+    def invoke(self, query: str, **kwargs):
+        all_docs = []
+        for retriever, weight in zip(self.retrievers, self.weights):
+            # 兼容不同的调用方式
+            try:
+                docs = retriever.invoke(query, **kwargs)
+            except AttributeError:
+                docs = retriever.get_relevant_documents(query, **kwargs)
+            for doc in docs:
+                doc.metadata['retriever_weight'] = weight
+            all_docs.extend(docs)
+        
+        # 去重（基于内容）
+        unique = {}
+        for doc in all_docs:
+            key = doc.page_content
+            if key not in unique:
+                unique[key] = doc
+        return list(unique.values())
+    
+    def get_relevant_documents(self, query: str, **kwargs):
+        return self.invoke(query, **kwargs)
+    
+def build_excel_vectorstore(excel_path: str, embed_model, save_path: str = "./excel_faiss"):
+    import pandas as pd
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from langchain_community.vectorstores.faiss import FAISS
+    from langchain_community.vectorstores.utils import DistanceStrategy
+
+    df = pd.read_excel(excel_path, engine='openpyxl')
+    print("实际列名:", df.columns.tolist())
+
+    if 'input' not in df.columns or 'response' not in df.columns:
+        raise ValueError("Excel 必须包含 'input' 和 'response' 列")
+
+    documents = []
+    for idx, row in df.iterrows():
+        question = str(row['input']) if pd.notna(row['input']) else ""
+        answer = str(row['response']) if pd.notna(row['response']) else ""
+        if not question and not answer:
+            continue
+        content = f"问题：{question}\n回答：{answer}"
+        score = row.get('total_score')
+        if pd.isna(score):
+            score = row.get('partial_score')
+        if pd.isna(score):
+            score = None
+        metadata = {
+            "score": score,
+            "row_idx": idx,
+            "source": "excel",
+            "input": question,
+            "response": answer
+        }
+        doc = Document(page_content=content, metadata=metadata)
+        documents.append(doc)
+
+    if not documents:
+        raise ValueError("没有有效的文档行，请检查 Excel 数据")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    docs = text_splitter.split_documents(documents)
+    # 过滤空文档
+    docs = [doc for doc in docs if doc.page_content.strip()]
+    # 手动截断超长文本（可选）
+    max_len = 512
+    for doc in docs:
+        if len(doc.page_content) > max_len:
+            doc.page_content = doc.page_content[:max_len]
+
+    vectorstore = FAISS.from_documents(
+        docs,
+        embed_model,
+        distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT
+    )
+    vectorstore.save_local(save_path)
+    print(f"Excel 向量库已构建，共 {len(docs)} 个片段，保存至 {save_path}")
+    return vectorstore
+
+
 
 # 4. 初始化 embedding 模型
 try:
@@ -132,10 +229,14 @@ except ImportError:
     embedding_class = HuggingFaceEmbeddings
 
 # 创建 embedding 模型
-embed_model = embedding_class(
+embed_model = HuggingFaceEmbeddings(
     model_name='maidalun1020/bce-embedding-base_v1',
     model_kwargs={'device': 'cuda:0'},
-    encode_kwargs={'batch_size': 32, 'normalize_embeddings': True}
+    encode_kwargs={
+        'batch_size': 32,
+        'normalize_embeddings': True
+        # 移除 padding, truncation, max_length
+    }
 )
 
 # 5. 初始化本地模型的 reranker
@@ -157,22 +258,39 @@ vectorstore = FAISS.from_documents(
     embed_model,
     distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT
 )
+excel_vectorstore = build_excel_vectorstore(
+    excel_path="eval.xlsx",  # 替换为您的 Excel 路径
+    embed_model=embed_model,
+    save_path="./excel_faiss"
+)
 
 # 创建基础检索器
 retriever = vectorstore.as_retriever(
     search_type="similarity",
     search_kwargs={"score_threshold": 0.3, "k": 10}
 )
+excel_retriever = excel_vectorstore.as_retriever(
+    search_type="similarity",
+    search_kwargs={"score_threshold": 0.3, "k": 10}  # 可根据需要调整
+)
+merged_retriever = MergedRetriever(
+    retrievers=[retriever, excel_retriever],
+    weights=[0.5, 0.5]
+)
 
 # 8. 创建压缩检索器
-compression_retriever = SimpleContextualCompressionRetriever(
+compression_retriever1 = SimpleContextualCompressionRetriever(
+    base_retriever=merged_retriever,
+    base_compressor=reranker
+)
+compression_retriever2 = SimpleContextualCompressionRetriever(
     base_retriever=retriever,
     base_compressor=reranker
 )
 
 # 9. 测试
 if __name__=="__main__":
-    response = compression_retriever.invoke("Dian团队是谁创立的?")
+    response = compression_retriever2.invoke("Dian团队是谁创立的?")
     doclist=[]
     #for i, doc in enumerate(response):
     #    doclist.append(doc.page_content)
@@ -184,4 +302,13 @@ if __name__=="__main__":
         if doc.metadata:
             print(f"元数据: {doc.metadata}")
         print("-" * 50)
-    
+    query = "Dian团队是哪个人创立的？"  # 选择一个与 Excel 中问题相似的问题
+    results = compression_retriever1.invoke(query)
+
+    print(f"共检索到 {len(results)} 个相关片段\n")
+    for i, doc in enumerate(results):
+        print(f"=== 片段 {i+1} ===")
+        print(f"内容: {doc.page_content[:300]}...")
+        if 'score' in doc.metadata:
+            print(f"总评分: {doc.metadata['score']}")
+        print()
