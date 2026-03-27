@@ -3,7 +3,7 @@ import os
 from openai import OpenAI
 from trans import SystemMessage,HumanMessage,AIMessage
 import json
-from rag import compression_retriever
+from rag import compression_retriever1,compression_retriever2
 """
 PROXY_URL="http://172.17.0.1:1081"
 os.environ["HTTP_PROXY"]=PROXY_URL
@@ -33,7 +33,7 @@ class Agent_Model:
         if self.system_prompt:
             self.messages.append({"role":"system","content":self.system_prompt})
             
-    def send_message(self,input,temperature=0.1,max_completion_tokens=100,tools=None):             #一般形式的对话
+    def send_message(self,input,temperature=0.1,max_completion_tokens=100,tools=None,excel=True):             #一般形式的对话
         if type(input)==str:
             self.messages.append({"role":"user","content":input})
         elif type(input)==list:
@@ -53,7 +53,10 @@ class Agent_Model:
                 function_args = json.loads(tool_call.function.arguments)
                 if function_name=="retrieve_from_knowledge_base":
                     query = function_args.get("query")
-                    function_response = compression_retriever.invoke(query)
+                    if excel:
+                        function_response = compression_retriever1.invoke(query)
+                    else:
+                        function_response = compression_retriever2.invoke(query)
                     doclist=[]
                     for i, doc in enumerate(function_response):
                         doclist.append(doc.page_content)
